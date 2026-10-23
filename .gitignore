@@ -1,0 +1,10 @@
+bin/
+build/
+*.o
+*.obj
+*.out
+README.html
+.DS_Store
+*.log
+logs/
+.vscode/
