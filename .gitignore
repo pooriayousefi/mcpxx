@@ -1,10 +1,14 @@
-bin/
-build/
-*.o
-*.obj
-*.out
-README.html
+# macOS
 .DS_Store
-*.log
-logs/
-.vscode/
+**/.DS_Store
+
+# Binaries
+bin/
+*.exe
+*.o
+*.a
+*.so
+*.dylib
+
+# Generated / unwanted
+README.html
