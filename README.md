@@ -1,4 +1,6 @@
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/pooriayousefi-mcpxx-gdiirb?v=6f67ce1af6957ae53c0e50b378d85e75)](https://m8ven.ai/mcp/pooriayousefi-mcpxx-gdiirb?s=readme)
+
 # mcpxx
 
 A modern, header-only **Model Context Protocol (MCP)** implementation written in **C++20**.
