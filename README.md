@@ -2,220 +2,204 @@
 
 # mcpxx
 
-A modern, header-only **Model Context Protocol (MCP)** implementation written in **C++20**.
+mcpxx is a C++20 implementation of the Model Context Protocol (MCP), with
+header-only client and server APIs and nine standalone tool servers. It
+supports stdio and Streamable HTTP transports and vendors its JSON and HTTP
+header dependencies under `include/`.
 
-- Protocol version: **2026-07-28**
-- Transports: **stdio** + **Streamable HTTP**
-- Focus: easy creation of MCP tool servers (especially converting existing REST / OpenAI-compatible tool servers)
+The protocol version advertised by this revision is `2026-07-28`.
 
 ## Features
 
-- Full support for the current MCP specification (stateless, `server/discover`, per-request `_meta`)
-- Dual transport out of the box:
-  - **stdio** (newline-delimited JSON-RPC) – recommended for local clients
-  - **HTTP** (POST `/mcp` + convenience endpoints)
-- Simple tool registration API
-- Rich error type (`Expected<JSON, Error>`)
-- Cross-platform (macOS, Linux, Windows)
-- Header-only core library
+- Register MCP tools with a name, description, JSON input schema, and handler.
+- Serve `tools/list` and `tools/call` over newline-delimited JSON-RPC on stdio
+  or Streamable HTTP at `/mcp`.
+- Connect to an MCP server over HTTP or launch a stdio server with `Client`.
+- Translate MCP tool definitions and responses with `OpenAIBridge`.
+- Use a cross-platform process wrapper, length-prefixed process IPC, and an
+  `Expected<Value, Error>` result type.
+- Build the included tool servers on macOS, Linux, and Windows with a C++20
+  compiler.
 
-## Project Layout
+## Repository layout
 
-```
-mcpxx/
-├── bin/                          # compiled binaries
-├── include/
-│   └── pooriayousefi/
-│       ├── expected.hpp
-│       ├── process.hpp
-│       └── mcp/
-│           ├── protocol.hpp
-│           ├── tool.hpp
-│           ├── server.hpp
-│           ├── client.hpp
-│           ├── stdio_framing.hpp
-│           ├── resource.hpp      # placeholder
-│           └── prompt.hpp        # placeholder
-├── src/
-│   ├── mcp_tool_shell_server.cpp         # example tool server
-│   ├── test_mcp_tool_shell_server.cpp    # full protocol test client
-│   └── test_mcp_protocol.cpp             # unit tests
-└── README.md
-```
-
-## Building
-
-```bash
-# Example tool server
-clang++ -std=c++20 -O3 -Wall -Wextra -I include \
-  src/mcp_tool_shell_server.cpp -o bin/mcp_tool_shell_server
-
-# Full test client
-clang++ -std=c++20 -O3 -Wall -Wextra -I include \
-  src/test_mcp_tool_shell_server.cpp -o bin/test_mcp_tool_shell_server
-
-# Protocol unit tests
-clang++ -std=c++20 -O3 -Wall -Wextra -I include \
-  src/test_mcp_protocol.cpp -o bin/test_mcp_protocol
+```text
+include/
+  cpp-httplib/httplib.h              Vendored HTTP library
+  nlohmann/json.hpp                  Vendored JSON library
+  pooriayousefi/
+    mcp/
+      client.hpp                     MCP client
+      openai_bridge.hpp              OpenAI-compatible tool JSON helpers
+      protocol.hpp                   JSON-RPC and MCP data types
+      server.hpp                     MCP server and tool registration
+      transport.hpp                  Stdio and Streamable HTTP transports
+    process/
+      ipc.hpp                        Length-prefixed process IPC
+      process.hpp                    Cross-platform process management
+    utility/
+      common.hpp                     Shared aliases
+      expected.hpp                   Expected result type
+src/
+  directory_mcp_tool_server.cpp
+  file_mcp_tool_server.cpp
+  git_mcp_tool_server.cpp
+  memory_mcp_tool_server.cpp
+  random_number_mcp_tool_server.cpp
+  shell_mcp_tool_server.cpp
+  statistics_mcp_tool_server.cpp
+  time_mcp_tool_server.cpp
+  utility_mcp_tool_server.cpp
 ```
 
-(On Linux you may need `-lpthread`. On Windows with MinGW add `-lws2_32`.)
+The `bin/` directory is for locally built executables and is excluded from
+version control. There is no project-level build system; compile each server
+from its corresponding source file.
 
-## Quick Start – Running the Example Server
+## Build
 
-### 1. STDIO mode (most common for MCP clients)
+From the repository root, build one server with Clang:
 
-```bash
-# The test client launches the server itself
-MCPXX_SHELL_ENABLED=1 ./bin/test_mcp_tool_shell_server stdio
+```sh
+mkdir -p bin
+clang++ -std=c++20 -O2 -pthread -I include \
+  src/time_mcp_tool_server.cpp -o bin/time_mcp_tool_server
 ```
 
-### 2. HTTP mode
+Replace the source and output names to build another server. GCC can be used
+in the same way. On Windows with MinGW, add `-lws2_32`; use the compiler's
+corresponding C++20 and threading options.
 
-```bash
-# Terminal 1 – start the server
-MCPXX_SHELL_ENABLED=1 ./bin/mcp_tool_shell_server http 127.0.0.1 8090
+## Tool servers
 
-# Terminal 2 – run the test client
-./bin/test_mcp_tool_shell_server http http://127.0.0.1:8090
+Each executable runs on stdio by default. The port shown below is used only
+when the server is started in HTTP mode.
+
+| Server | Default HTTP port | Tools |
+|---|---:|---|
+| `shell` | 8090 | `run_command`, `run_program` |
+| `time` | 8091 | `get_current_time`, `get_local_time`, `get_unix_timestamp` |
+| `directory` | 8094 | `create_directory`, `list_directory`, `iterate_directories_recursively`, `delete_directory`, `get_last_modified_file` |
+| `file` | 8093 | `read_file`, `read_file_base64`, `get_file_info`, `hash_file`, `search_in_file`, `write_file`, `replace_in_file`, `truncate_file`, `move_file`, `delete_file` |
+| `git` | 8099 | `git_init`, `git_status`, `git_diff`, `git_log`, `git_show`, `git_add`, `git_commit`, `git_branch`, `git_current_branch`, `git_checkout`, `git_create_branch`, `git_reset`, `git_stash`, `git_remote`, `git_fetch`, `git_pull`, `git_push`, `git_clone` |
+| `random_number` | 8095 | 17 random-distribution tools |
+| `statistics` | 8096 | 27 statistical and arithmetic tools |
+| `memory` | 8097 | `recall_memory`, `list_keys`, `save_memory` |
+| `utility` | 8098 | 14 string, JSON, and UUID tools |
+
+The file, directory, git, and shell servers operate on the host environment.
+The memory server persists its in-process key/value store to a JSON file.
+Statistics, random-number, time, and utility operations do not require access
+to a remote service.
+
+## Run a server
+
+Start a server over stdio (the default):
+
+```sh
+./bin/time_mcp_tool_server
 ```
 
-> **Safety note**  
-> The example server only executes shell/program commands when the environment variable  
-> `MCPXX_SHELL_ENABLED=1` is set. This is intentional.
+Start the same server over HTTP:
 
-## How to Create Your Own MCP Tool Server
+```sh
+./bin/time_mcp_tool_server http 127.0.0.1 8091
+```
 
-1. Create a new `.cpp` file (e.g. `src/mcp_tool_my_service.cpp`).
-2. Include the server header and register tools:
+The command-line interface also accepts `both` to serve stdio and HTTP
+simultaneously:
+
+```sh
+./bin/time_mcp_tool_server both 127.0.0.1 8091
+```
+
+The host and port can be supplied for HTTP mode; the compiled-in default port
+is used when the port is omitted. Bind to a suitably restricted interface:
+tool servers can access local resources, and the shell and git servers can
+perform consequential operations.
+
+### Shell server
+
+Shell execution is disabled unless `MCPXX_SHELL_ENABLED=1` is set in the
+server's environment. The `run_command` tool executes shell commands; do not
+enable it for untrusted clients or expose it on an untrusted network.
+
+```sh
+MCPXX_SHELL_ENABLED=1 ./bin/shell_mcp_tool_server
+```
+
+## Create a tool server
+
+Include the server and result headers, define a handler, register a `Tool`, and
+use `run_cli` to select the transport:
 
 ```cpp
 #include "pooriayousefi/mcp/server.hpp"
-#include "pooriayousefi/expected.hpp"
+#include "pooriayousefi/utility/expected.hpp"
 
+using pooriayousefi::Expected;
+using pooriayousefi::Json;
 using namespace pooriayousefi::mcp;
 
-Expected<JSON, Error> my_tool_handler(const JSON& args)
+Expected<Json, Error> echo(const Json& args)
 {
-    // your logic here
-    return JSON{{"result", "hello"}};
+    Expected<Json, Error> result{};
+    if (!args.contains("text") || !args["text"].is_string())
+    {
+        result.set_error(Error{
+            error_code::INVALID_PARAMS,
+            "Missing or non-string 'text' argument"
+        });
+        return result;
+    }
+
+    result.set_value(Json{{"text", args["text"]}});
+    return result;
 }
 
 int main(int argc, char* argv[])
 {
-    Server server{"my-service", "1.0.0"};
+    Server server{"example", "1.0.0"};
 
-    server.add_tool(
-        "my_tool",
-        "Description of the tool",
-        JSON::parse(R"({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string" }
-            },
-            "required": ["query"]
-        })"),
-        my_tool_handler
-    );
+    Tool tool{};
+    tool.name = "echo";
+    tool.description = "Returns the supplied text.";
+    tool.input_schema = Json{
+        {"type", "object"},
+        {"properties", Json{{"text", Json{{"type", "string"}}}}},
+        {"required", Json::array({"text"})}
+    };
+    tool.handler = echo;
+    server.add_tool(std::move(tool));
 
-    // Dual transport support
-    if (argc >= 2 && std::string(argv[1]) == "http")
-    {
-        std::string host = argc >= 3 ? argv[2] : "127.0.0.1";
-        int port = argc >= 4 ? std::stoi(argv[3]) : 8090;
-        server.run_http(host, port);
-    }
-    else
-    {
-        server.run_stdio();
-    }
+    return server.run_cli(argc, argv, 8090);
 }
 ```
 
-3. Build and run exactly like the shell example.
+`Expected<Value, Error>` begins empty; set its state with `set_value()` or
+`set_error()`. Inspect the state with `has_value()`, `has_error()`, or its
+explicit boolean conversion, and read it with `get_value()` or `get_error()`.
 
-Both transports are available with zero extra work.
+## Client
 
-## Using with llama.cpp / llama-ui
+`Client` can connect to an HTTP server or start a stdio server process. Both
+`list_tools()` and `call_tool()` return `Expected` results:
 
-### Option A – STDIO (Recommended)
+```cpp
+#include "pooriayousefi/mcp/client.hpp"
 
-Create a file `mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "shell": {
-      "command": "/ABSOLUTE/PATH/TO/mcpxx/bin/mcp_tool_shell_server",
-      "args": [],
-      "env": {
-        "MCPXX_SHELL_ENABLED": "1"
-      },
-      "timeout_ms": 60000
-    }
-  }
-}
+pooriayousefi::mcp::Client client{"127.0.0.1", 8091};
+auto tools = client.list_tools();
+auto result = client.call_tool(
+    "get_current_time",
+    nlohmann::json::object());
 ```
 
-Start `llama-server`:
+For stdio, construct the client with an executable path, its argument vector,
+and optionally an environment-variable map.
 
-```bash
-llama-server \
-  -m /path/to/your/model.gguf \
-  --mcp-servers-config /path/to/mcp.json \
-  --host 127.0.0.1 \
-  --port 8080 \
-  -ngl 99
-```
+## Dependencies and license
 
-(You can also pass the JSON inline with `--mcp-servers-json`.)
-
-The tools will appear as:
-- `shell_run_command`
-- `shell_run_program`
-
-### Option B – HTTP (for llama-ui Web UI)
-
-1. Start the MCP server:
-
-```bash
-MCPXX_SHELL_ENABLED=1 ./bin/mcp_tool_shell_server http 127.0.0.1 8090
-```
-
-2. Start `llama-server` with the MCP proxy enabled:
-
-```bash
-llama-server \
-  -m /path/to/your/model.gguf \
-  --ui-mcp-proxy \
-  --host 127.0.0.1 \
-  --port 8080 \
-  -ngl 99
-```
-
-3. In the Web UI:
-   - Go to **MCP Servers** (or Settings → MCP)
-   - Click **Add New Server**
-   - Enter: `http://127.0.0.1:8090/mcp`
-   - Enable the toggle **“Use llama-server proxy”**
-   - Save and enable the server
-
-## Convenience HTTP Endpoints
-
-When running in HTTP mode the server also exposes:
-
-| Endpoint          | Method | Description                          |
-|-------------------|--------|--------------------------------------|
-| `/mcp`            | POST   | Official MCP endpoint                |
-| `/schema`         | GET    | OpenAI-style tools schema            |
-| `/tools/call`     | POST   | Simple REST-style tool invocation    |
-
-## Safety
-
-The example `mcp_tool_shell_server` contains a denylist and requires an explicit environment variable before any command is executed.  
-**Never** run it with `MCPXX_SHELL_ENABLED=1` on an untrusted machine or without additional sandboxing.
-
-## License
-
-Apache 2.0
-```
+The repository includes `nlohmann/json` (MIT) and `cpp-httplib` (MIT) headers
+under `include/`. mcpxx is distributed under the Apache License, Version 2.0;
+see [LICENSE](./LICENSE).

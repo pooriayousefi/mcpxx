@@ -1,40 +1,19 @@
 // ============================================================================
-//  mcp_tool_shell_server.cpp — MCP Tool Server for controlled shell / program execution
-//  Project: mcpxx
+//  src/shell_mcp_tool_server.cpp — MCP Shell and Program Execution Server
+//  Project: mcpxx | C++20 | Apache-2.0
 //
-//  Tools:
-//    run_command  — executes arbitrary shell commands via popen (supports pipes, redirects, &&)
-//    run_program  — executes a program directly via process.hpp (no shell, injection-safe)
-//
-//  Safety:
-//    - Denylist of catastrophic patterns
-//    - Must set environment variable MCPXX_SHELL_ENABLED=1 to enable execution
-//
-//  Transports:
-//    stdio  (default)  or  HTTP  (Streamable-style + convenience endpoints)
-//
-//  Build:
-//
-//    macOS / Linux:
-//      clang++ -std=c++20 -O3 -I include examples/mcp_tool_shell_server.cpp -o bin/mcp_tool_shell_server
-//
-//    Linux (gcc):
-//      g++ -std=c++20 -O3 -I include examples/mcp_tool_shell_server.cpp -o bin/mcp_tool_shell_server -lpthread
-//
-//    Windows (MinGW / clang):
-//      clang++ -std=c++20 -O3 -I include examples/mcp_tool_shell_server.cpp -o bin/mcp_tool_shell_server.exe -lws2_32
-//
-//  Usage:
-//      ./bin/mcp_tool_shell_server                  # stdio mode (default)
-//      ./bin/mcp_tool_shell_server http 127.0.0.1 8090
+//  Provides shell-command and direct-program execution tools. Execution is
+//  disabled unless MCPXX_SHELL_ENABLED=1 is set. Runs over stdio by default
+//  or Streamable HTTP on port 8090 by default; treat access as privileged.
 // ============================================================================
 
+#include "pooriayousefi/utility/common.hpp"
 #include "pooriayousefi/mcp/server.hpp"
-#include "pooriayousefi/mcp/protocol.hpp"
-#include "pooriayousefi/expected.hpp"
-#include "pooriayousefi/process.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -50,11 +29,8 @@
     #define PCLOSE pclose
 #endif
 
-namespace
+namespace pooriayousefi::mcp
 {
-    using namespace pooriayousefi;
-    using namespace pooriayousefi::mcp;
-
     constexpr std::size_t MAX_OUTPUT_LENGTH = 8000;
     constexpr const char* ENV_SHELL_ENABLED = "MCPXX_SHELL_ENABLED";
 
@@ -157,24 +133,24 @@ namespace
     // ------------------------------------------------------------------
     //  Tool: run_command
     // ------------------------------------------------------------------
-    Expected<JSON, Error> tool_run_command(const JSON& args)
+    Expected<Json, Error> tool_run_command(const Json& args)
     {
-        Expected<JSON, Error> result{};
+        Expected<Json, Error> result{};
 
         if (!shell_execution_enabled())
         {
-            result = Error{
+            result.set_error(Error{
                 error_code::INTERNAL_ERROR,
                 "Shell execution is disabled. Set MCPXX_SHELL_ENABLED=1 to enable it "
                 "(only in a sandboxed environment)."
-            };
+            });
         }
         else if (!args.contains("command") || !args["command"].is_string())
         {
-            result = Error{
+            result.set_error(Error{
                 error_code::INVALID_PARAMS,
                 "Missing or non-string 'command' argument"
-            };
+            });
         }
         else
         {
@@ -182,10 +158,10 @@ namespace
 
             if (is_denylisted(command))
             {
-                result = Error{
+                result.set_error(Error{
                     error_code::INVALID_PARAMS,
                     "Command rejected: matches a denylisted catastrophic pattern"
-                };
+                });
             }
             else
             {
@@ -209,10 +185,10 @@ namespace
 
                 if (!pipe)
                 {
-                    result = Error{
+                    result.set_error(Error{
                         error_code::INTERNAL_ERROR,
                         "Failed to open pipe for command execution"
-                    };
+                    });
                 }
                 else
                 {
@@ -227,9 +203,12 @@ namespace
                         output = output.substr(0, MAX_OUTPUT_LENGTH) + "\n...[Output truncated]...";
                     }
 
-                    result = JSON{
+                    // NOTE: Json::object(...) is mandatory here. The single-pair
+                    // braced form Json{{"output", output}} can be interpreted as
+                    // an ARRAY (both elements are strings) by nlohmann.
+                    result.set_value(Json::object({
                         {"output", output}
-                    };
+                    }));
                 }
             }
         }
@@ -240,24 +219,24 @@ namespace
     // ------------------------------------------------------------------
     //  Tool: run_program
     // ------------------------------------------------------------------
-    Expected<JSON, Error> tool_run_program(const JSON& args)
+    Expected<Json, Error> tool_run_program(const Json& args)
     {
-        Expected<JSON, Error> result{};
+        Expected<Json, Error> result{};
 
         if (!shell_execution_enabled())
         {
-            result = Error{
+            result.set_error(Error{
                 error_code::INTERNAL_ERROR,
                 "Shell execution is disabled. Set MCPXX_SHELL_ENABLED=1 to enable it "
                 "(only in a sandboxed environment)."
-            };
+            });
         }
         else if (!args.contains("program") || !args["program"].is_string())
         {
-            result = Error{
+            result.set_error(Error{
                 error_code::INVALID_PARAMS,
                 "Missing or non-string 'program' argument"
-            };
+            });
         }
         else
         {
@@ -301,17 +280,18 @@ namespace
                     output = output.substr(0, MAX_OUTPUT_LENGTH) + "\n...[Output truncated]...";
                 }
 
-                result = JSON{
+                // NOTE: Json::object(...) is mandatory here (see run_command).
+                result.set_value(Json::object({
                     {"output", output},
                     {"exit_code", exit_code}
-                };
+                }));
             }
             catch (const std::exception& e)
             {
-                result = Error{
+                result.set_error(Error{
                     error_code::INTERNAL_ERROR,
                     std::string("Failed to run program: ") + e.what()
-                };
+                });
             }
         }
 
@@ -327,92 +307,80 @@ int main(int argc, char* argv[])
     using namespace pooriayousefi::mcp;
 
     Server server{"mcp-tool-shell-server", "1.0.0"};
+    server.set_instructions(
+        "Controlled shell and program execution. run_command runs a shell "
+        "command (pipes, redirects, &&) and returns combined stdout+stderr; "
+        "run_program executes a binary directly without a shell (injection-safe). "
+        "Both tools are disabled unless the environment variable "
+        "MCPXX_SHELL_ENABLED=1 is set (use only in a sandboxed environment)."
+    );
 
     // ----- run_command -------------------------------------------------
-    server.add_tool(
-        "run_command",
+    Tool run_command_tool{};
+    run_command_tool.name = "run_command";
+    run_command_tool.description =
         "Executes an arbitrary shell command locally and returns combined stdout+stderr. "
         "Supports pipes, redirects, &&, etc. High-risk tool — protected by denylist and "
-        "MCPXX_SHELL_ENABLED environment variable.",
-        JSON::parse(R"({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The exact shell command to execute (e.g. 'ls -la' or 'python main.py') "
-                },
-                "input": {
-                    "type": "string",
-                    "description": "Optional standard input to feed to the command"
-                }
+        "MCPXX_SHELL_ENABLED environment variable.";
+    run_command_tool.input_schema = Json::parse(R"({
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "The exact shell command to execute (e.g. 'ls -la' or 'python main.py') "
             },
-            "required": ["command"]
-        })"),
-        tool_run_command
-    );
+            "input": {
+                "type": "string",
+                "description": "Optional standard input to feed to the command"
+            }
+        },
+        "required": ["command"]
+    })");
+    run_command_tool.handler = tool_run_command;
+    server.add_tool(std::move(run_command_tool));
 
     // ----- run_program -------------------------------------------------
-    server.add_tool(
-        "run_program",
+    Tool run_program_tool{};
+    run_program_tool.name = "run_program";
+    run_program_tool.description =
         "Executes a program directly (no shell) with the given arguments. "
-        "Shell-injection-safe. Use when you do not need shell features.",
-        JSON::parse(R"({
-            "type": "object",
-            "properties": {
-                "program": {
-                    "type": "string",
-                    "description": "Executable name or path (e.g. 'python', '/usr/bin/git') "
-                },
-                "args": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    },
-                    "description": "Arguments to pass to the program"
-                },
-                "input": {
-                    "type": "string",
-                    "description": "Optional standard input to feed to the program"
-                }
+        "Shell-injection-safe. Use when you do not need shell features.";
+    run_program_tool.input_schema = Json::parse(R"({
+        "type": "object",
+        "properties": {
+            "program": {
+                "type": "string",
+                "description": "Executable name or path (e.g. 'python', '/usr/bin/git') "
             },
-            "required": ["program"]
-        })"),
-        tool_run_program
-    );
+            "args": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "Arguments to pass to the program"
+            },
+            "input": {
+                "type": "string",
+                "description": "Optional standard input to feed to the program"
+            }
+        },
+        "required": ["program"]
+    })");
+    run_program_tool.handler = tool_run_program;
+    server.add_tool(std::move(run_program_tool));
 
-    // Transport selection
-    if (argc >= 2 && std::string(argv[1]) == "http")
+    // ----- transport selection + safety notice --------------------------
+    // run_cli contract (server.hpp):
+    //   no arguments            -> stdio transport (newline-delimited Json-RPC)
+    //   http [host] [port]      -> Streamable HTTP (default port below)
+    //   --http [host] [port]    -> Streamable HTTP
+    //   --help | -h             -> usage on stderr
+    if (!shell_execution_enabled())
     {
-        std::string host = "127.0.0.1";
-        int port = 8090;
-
-        if (argc >= 3)
-        {
-            host = argv[2];
-        }
-        if (argc >= 4)
-        {
-            port = std::stoi(argv[3]);
-        }
-
-        if (!shell_execution_enabled())
-        {
-            std::cout << "WARNING: Shell execution is DISABLED. "
-                      << "Set MCPXX_SHELL_ENABLED=1 to enable it.\n";
-        }
-
-        server.run_http(host, port);
-    }
-    else
-    {
-        if (!shell_execution_enabled())
-        {
-            std::cerr << "WARNING: Shell execution is DISABLED. "
-                      << "Set MCPXX_SHELL_ENABLED=1 to enable it.\n";
-        }
-
-        server.run_stdio();
+        std::cerr << "WARNING: Shell execution is DISABLED. "
+                  << "Set MCPXX_SHELL_ENABLED=1 to enable it.\n";
     }
 
-    return 0;
+    const int exit_code = server.run_cli(argc, argv, 8090);
+    return exit_code;
 }

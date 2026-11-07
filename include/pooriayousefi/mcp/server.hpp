@@ -1,451 +1,405 @@
 // ============================================================================
-//  server.hpp — MCP Server (stdio + Streamable HTTP) — C++20
-//  Project: mcpxx
-//  Developed by: Pooria Yousefi
-//  License: Apache 2.0
+//  pooriayousefi/mcp/server.hpp — MCP Tool Server
+//  Project: mcpxx | C++20 | Apache-2.0
 //
-//  Example usage:
-//
-//    mcp::Server server{"shell-mcp-server", "1.0.0"};
-//
-//    server.add_tool(
-//        "run_command",
-//        "Execute a shell command",
-//        JSON::parse(R"({ "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] })"),
-//        [](const JSON& args) -> mcp::Expected<JSON, mcp::Error> {
-//            // your logic
-//            return JSON{{"output", "hello"}};
-//        }
-//    );
-//
-//    server.run_stdio();          // or
-//    server.run_http("0.0.0.0", 8080);
+//  Register tool definitions and handlers, then serve MCP requests over
+//  stdio, Streamable HTTP, or both using Server::run_cli().
 // ============================================================================
+
 #pragma once
 
-#include "pooriayousefi/expected.hpp"
-#include "pooriayousefi/mcp/protocol.hpp"
-#include "pooriayousefi/mcp/tool.hpp"
-#include "pooriayousefi/mcp/resource.hpp"
-#include "pooriayousefi/mcp/prompt.hpp"
-
-#include "cpp-httplib/httplib.h"
-
-#include <functional>
-#include <iostream>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <utility>
 #include <vector>
+#include <functional>
+#include <iostream>
+#include <unordered_map>
+#include <shared_mutex>
+#include <mutex>
+#include <thread>
+#include "nlohmann/json.hpp"
+#include "pooriayousefi/utility/common.hpp"
+#include "pooriayousefi/mcp/protocol.hpp"
+#include "pooriayousefi/mcp/transport.hpp"
 
 namespace pooriayousefi::mcp
 {
+    using pooriayousefi::Json;
+
+    enum class error_code
+    {
+        INVALID_PARAMS = static_cast<int>(ErrorCode::INVALID_PARAMS),
+        INTERNAL_ERROR = static_cast<int>(ErrorCode::INTERNAL_ERROR)
+    };
+
+    struct Error
+    {
+        error_code code{error_code::INTERNAL_ERROR};
+        std::string message{};
+    };
+
+    using ToolHandler = std::function<Expected<Json, Error>(const Json&)>;
+
+    struct Tool
+    {
+        std::string name{};
+        std::string title{};
+        std::string description{};
+        Json input_schema{Json::object()};
+        ToolHandler handler{};
+    };
+
     class Server
     {
     public:
+        using LegacyToolHandler = std::function<ToolCallResult(const nlohmann::json& arguments)>;
+
+        Server() = default;
         Server(std::string name, std::string version)
-            : server_info_{std::move(name), std::move(version)}
+            : name_{std::move(name)}, version_{std::move(version)}
         {
         }
+        ~Server() = default;
 
         Server(const Server&) = delete;
         Server& operator=(const Server&) = delete;
+        Server(Server&&) noexcept = delete;
+        Server& operator=(Server&&) noexcept = delete;
 
-        // ----------------------------------------------------------------
-        //  Registration
-        // ----------------------------------------------------------------
-        void add_tool(
-            std::string name,
-            std::string description,
-            JSON input_schema,
-            ToolHandler handler
-        )
+        void register_tool(const ToolDefinition& definition, LegacyToolHandler handler)
         {
-            // Important: make a copy of the name for the map key
-            // before moving it into the Tool object.
-            std::string key = name;
-
-            tools_.emplace(
-                std::move(key),
-                Tool{
-                    std::move(name),
-                    std::move(description),
-                    std::move(input_schema),
-                    std::move(handler)
-                }
-            );
+            std::unique_lock<std::shared_mutex> lock{mutex_};
+            tools_[definition.name] = definition;
+            handlers_[definition.name] = std::move(handler);
         }
 
-        // Placeholder registration APIs (for future expansion)
-        void add_resource(Resource resource)
+        void add_tool(Tool tool)
         {
-            resources_.push_back(std::move(resource));
-        }
-
-        void add_prompt(Prompt prompt)
-        {
-            prompts_.push_back(std::move(prompt));
-        }
-
-        // ----------------------------------------------------------------
-        //  Transports
-        // ----------------------------------------------------------------
-        void run_stdio()
-        {
-            // Simple synchronous stdio loop (newline-delimited)
-            std::string line;
-            while (std::getline(std::cin, line))
+            ToolDefinition definition{};
+            definition.name = tool.name;
+            definition.description = tool.description;
+            definition.input_schema = std::move(tool.input_schema);
+            register_tool(definition, [handler = std::move(tool.handler)](const Json& arguments)
             {
-                if (line.empty())
+                ToolCallResult result{};
+                if (!handler)
                 {
-                    continue;
+                    result.is_error = true;
+                    result.content = "Tool handler is not configured.";
+                    return result;
                 }
+                auto outcome = handler(arguments);
+                if (outcome.has_error())
+                {
+                    result.is_error = true;
+                    result.content = outcome.get_error().message;
+                }
+                else if (outcome.has_value())
+                {
+                    result.content = outcome.get_value().dump();
+                }
+                else
+                {
+                    result.is_error = true;
+                    result.content = "Tool handler returned no result.";
+                }
+                return result;
+            });
+        }
 
-                try
-                {
-                    JSON message = JSON::parse(line);
-                    JSON response = handle_message(message);
+        void set_instructions(std::string instructions)
+        {
+            instructions_ = std::move(instructions);
+        }
 
-                    if (!response.is_null())
-                    {
-                        std::cout << response.dump() << std::endl;
-                    }
-                }
-                catch (const JSON::parse_error& e)
+        [[nodiscard]] std::string handle_message(std::string_view raw_request)
+        {
+            auto parse_result = nlohmann::json::parse(raw_request, nullptr, false);
+            if (parse_result.is_discarded())
+            {
+                return make_error_response(ErrorCode::PARSE_ERROR, "Parse error: invalid JSON");
+            }
+
+            if (!parse_result.is_object() || !parse_result.contains("jsonrpc") ||
+                !parse_result["jsonrpc"].is_string() || parse_result["jsonrpc"] != "2.0" ||
+                !parse_result.contains("method") || !parse_result["method"].is_string() ||
+                parse_result["method"].get_ref<const std::string&>().empty())
+            {
+                return make_error_response(ErrorCode::INVALID_REQUEST, "Invalid JSON-RPC request");
+            }
+
+            const bool has_id = parse_result.contains("id");
+            const Json id = has_id ? parse_result["id"] : Json(Json::value_t::discarded);
+            if (has_id && !is_valid_request_id(id))
+            {
+                return make_error_response(ErrorCode::INVALID_REQUEST, "Request ID must be a string or integer");
+            }
+
+            Json params = parse_result.value("params", Json::object());
+            if (!params.is_object())
+            {
+                return has_id
+                    ? make_error_response(ErrorCode::INVALID_PARAMS, "Request params must be an object", id)
+                    : std::string{};
+            }
+
+            if (has_id)
+            {
+                const Json meta = params.value("_meta", Json::object());
+                if (!meta.is_object() ||
+                    !meta.contains(std::string{MCP_PROTOCOL_VERSION_META}) ||
+                    !meta[std::string{MCP_PROTOCOL_VERSION_META}].is_string() ||
+                    !meta.contains(std::string{MCP_CLIENT_CAPABILITIES_META}) ||
+                    !meta[std::string{MCP_CLIENT_CAPABILITIES_META}].is_object())
                 {
-                    JSON error_response = make_error(
-                        nullptr,
-                        error_code::PARSE_ERROR,
-                        std::string("Parse error: ") + e.what()
-                    );
-                    std::cout << error_response.dump() << std::endl;
+                    return make_error_response(ErrorCode::INVALID_REQUEST,
+                                               "Request _meta is missing required MCP metadata", id);
                 }
-                catch (...)
+                if (meta[std::string{MCP_PROTOCOL_VERSION_META}] != MCP_PROTOCOL_VERSION)
                 {
-                    JSON error_response = make_error(
-                        nullptr,
-                        error_code::INTERNAL_ERROR,
-                        "Internal server error"
-                    );
-                    std::cout << error_response.dump() << std::endl;
+                    return make_error_response(
+                        ErrorCode::UNSUPPORTED_PROTOCOL_VERSION,
+                        "Unsupported protocol version",
+                        id,
+                        Json{{"supportedVersions", Json::array({MCP_PROTOCOL_VERSION})}});
                 }
             }
+            else
+            {
+                return {};
+            }
+
+            const std::string& method = parse_result["method"].get_ref<const std::string&>();
+            Json result{};
+            if (method == "tools/list")
+            {
+                result = handle_tools_list();
+            }
+            else if (method == "tools/call")
+            {
+                if (!params.contains("name") || !params["name"].is_string() ||
+                    (params.contains("arguments") && !params["arguments"].is_object()))
+                {
+                    return make_error_response(ErrorCode::INVALID_PARAMS,
+                                               "tools/call requires a name and object arguments", id);
+                }
+                result = handle_tools_call(params);
+            }
+            else if (method == "ping")
+            {
+                result = nlohmann::json{{"resultType", "complete"}};
+            }
+            else
+            {
+                return make_error_response(ErrorCode::METHOD_NOT_FOUND, "Method not found: " + method, id);
+            }
+
+            Json response{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}};
+            return response.dump();
         }
 
-        void run_http(std::string host, int port)
+        bool start_http(std::string_view host, int port)
         {
-            httplib::Server http;
-
-            // Convenience OpenAI-style schema endpoint (as requested)
-            http.Get("/schema", [this](const httplib::Request&, httplib::Response& res) {
-                res.set_content(build_openai_style_schema().dump(2), "application/json");
+            http_transport_.set_handler([this](std::string_view body)
+            {
+                return handle_message(body);
             });
 
-            // Main MCP endpoint (Streamable HTTP style — simplified for v1)
-            http.Post("/mcp", [this](const httplib::Request& req, httplib::Response& res) {
+            return http_transport_.listen(host, port);
+        }
+
+        int run_stdio()
+        {
+            std::string line{};
+            while (std::getline(std::cin, line))
+            {
+                const std::string response = handle_message(line);
+                if (!response.empty())
+                {
+                    std::cout << response << '\n' << std::flush;
+                }
+            }
+            return 0;
+        }
+
+        int run_cli(int argc, char* argv[], int default_port)
+        {
+            std::string mode = argc > 1 ? argv[1] : "stdio";
+            if (mode == "--http")
+            {
+                mode = "http";
+            }
+            if (mode == "stdio")
+            {
+                return run_stdio();
+            }
+
+            std::string host{"127.0.0.1"};
+            int port = default_port;
+            int port_index = 2;
+            if (argc > 2 && mode != "http" && mode != "both")
+            {
+                host = mode;
+                port_index = 2;
+            }
+            else if (argc > 2 && (mode == "http" || mode == "both"))
+            {
+                host = argv[2];
+                port_index = 3;
+            }
+            if (argc > port_index)
+            {
                 try
                 {
-                    JSON message = JSON::parse(req.body);
-                    JSON response = handle_message(message);
-
-                    if (response.is_null())
-                    {
-                        res.status = 204;
-                    }
-                    else
-                    {
-                        res.set_content(response.dump(), "application/json");
-                    }
+                    port = std::stoi(argv[port_index]);
                 }
-                catch (const JSON::parse_error& e)
+                catch (const std::exception&)
                 {
-                    res.status = 400;
-                    res.set_content(
-                        make_error(nullptr, error_code::PARSE_ERROR, e.what()).dump(),
-                        "application/json"
-                    );
+                    std::cerr << "Invalid HTTP port: " << argv[port_index] << '\n';
+                    return 2;
                 }
-                catch (...)
+            }
+            if (port < 1 || port > 65535)
+            {
+                std::cerr << "HTTP port must be between 1 and 65535.\n";
+                return 2;
+            }
+
+            if (mode == "http")
+            {
+                return start_http(host, port) ? 0 : 1;
+            }
+            if (mode == "both")
+            {
+                http_transport_.set_handler([this](std::string_view body)
                 {
-                    res.status = 500;
-                    res.set_content(
-                        make_error(nullptr, error_code::INTERNAL_ERROR, "Internal error").dump(),
-                        "application/json"
-                    );
+                    return handle_message(body);
+                });
+                if (!http_transport_.bind(host, port))
+                {
+                    std::cerr << "Failed to bind MCP HTTP transport on "
+                              << host << ":" << port << '\n';
+                    return 1;
                 }
-            });
-
-            // Also accept tool calls on a REST-like path for easier migration
-            http.Post("/tools/call", [this](const httplib::Request& req, httplib::Response& res) {
-                try
+                int http_exit_code{0};
+                std::thread http_thread([this, &http_exit_code]
                 {
-                    JSON body = JSON::parse(req.body);
-                    std::string tool_name = body.value("name", "");
-                    JSON arguments = body.value("arguments", JSON::object());
-
-                    auto call_result = call_tool(tool_name, arguments);
-
-                    if (call_result.has_value())
+                    if (!http_transport_.listen_after_bind())
                     {
-                        res.set_content(
-                            JSON{{"result", call_result.value()}, {"is_error", false}}.dump(),
-                            "application/json"
-                        );
+                        http_exit_code = 1;
                     }
-                    else
-                    {
-                        res.set_content(
-                            JSON{
-                                {"error", call_result.error().message},
-                                {"is_error", true},
-                                {"code", call_result.error().code}
-                            }.dump(),
-                            "application/json"
-                        );
-                    }
-                }
-                catch (...)
-                {
-                    res.status = 500;
-                    res.set_content(
-                        JSON{{"error", "Internal error"}, {"is_error", true}}.dump(),
-                        "application/json"
-                    );
-                }
-            });
+                });
+                const int stdio_exit_code = run_stdio();
+                stop_http();
+                http_thread.join();
+                return http_exit_code != 0 ? http_exit_code : stdio_exit_code;
+            }
+            std::cerr << "Usage: " << argv[0] << " [stdio|http [host] [port]|both [host] [port]]\n";
+            return 2;
+        }
 
-            std::cout << "MCP server \"" << server_info_.name
-                      << "\" listening on http://" << host << ":" << port << std::endl;
-            std::cout << "  - Official MCP endpoint : POST /mcp" << std::endl;
-            std::cout << "  - Convenience schema    : GET  /schema" << std::endl;
-            std::cout << "  - REST-style tool call  : POST /tools/call" << std::endl;
-
-            http.listen(host, port);
+        void stop_http()
+        {
+            http_transport_.stop();
         }
 
     private:
-        ServerInfo server_info_;
-        std::unordered_map<std::string, Tool> tools_;
-        std::vector<Resource> resources_;
-        std::vector<Prompt> prompts_;
+        mutable std::shared_mutex mutex_{};
+        std::unordered_map<std::string, ToolDefinition> tools_{};
+        std::unordered_map<std::string, LegacyToolHandler> handlers_{};
+        HttpServerTransport http_transport_{};
+        std::string name_{};
+        std::string version_{};
+        std::string instructions_{};
 
-        // ----------------------------------------------------------------
-        //  Message dispatcher
-        // ----------------------------------------------------------------
-        JSON handle_message(const JSON& message)
+        [[nodiscard]] nlohmann::json handle_tools_list()
         {
-            JSON result = nullptr;
-
-            if (!message.is_object())
+            std::shared_lock<std::shared_mutex> lock{mutex_};
+            nlohmann::json j{{"resultType", "complete"}};
+            nlohmann::json tools_arr = nlohmann::json::array();
+            std::vector<std::string> tool_names{};
+            tool_names.reserve(tools_.size());
+            for (const auto& pair : tools_)
             {
-                result = make_error(nullptr, error_code::INVALID_REQUEST, "Message must be an object");
+                tool_names.push_back(pair.first);
             }
-            else if (is_notification(message))
+            std::sort(tool_names.begin(), tool_names.end());
+            for (const auto& name : tool_names)
             {
-                // Notifications are ignored for now (no response)
-                result = nullptr;
+                tools_arr.push_back(tools_.at(name).to_json());
             }
-            else if (!is_valid_request(message))
-            {
-                JSON id = message.contains("id") ? message["id"] : nullptr;
-                result = make_error(id, error_code::INVALID_REQUEST, "Invalid request");
-            }
-            else
-            {
-                const JSON& id = message["id"];
-                const std::string method = message["method"].get<std::string>();
-                JSON params = message.value("params", JSON::object());
-
-                if (method == "server/discover")
-                {
-                    result = handle_discover(id);
-                }
-                else if (method == "tools/list")
-                {
-                    result = handle_tools_list(id);
-                }
-                else if (method == "tools/call")
-                {
-                    result = handle_tools_call(id, params);
-                }
-                else
-                {
-                    result = make_error(id, error_code::METHOD_NOT_FOUND, "Method not found: " + method);
-                }
-            }
-
-            return result;
+            j["tools"] = tools_arr;
+            return j;
         }
 
-        // ----------------------------------------------------------------
-        //  Method handlers
-        // ----------------------------------------------------------------
-        JSON handle_discover(const JSON& id)
+        [[nodiscard]] nlohmann::json handle_tools_call(const nlohmann::json& params)
         {
-            JSON capabilities = JSON::object();
+            std::string tool_name{};
+            nlohmann::json args = nlohmann::json::object();
 
-            if (!tools_.empty())
+            if (params.contains("name") && params["name"].is_string())
             {
-                capabilities["tools"] = JSON::object();
+                tool_name = params["name"].get<std::string>();
             }
-            if (!resources_.empty())
+            if (params.contains("arguments"))
             {
-                capabilities["resources"] = JSON::object();
-            }
-            if (!prompts_.empty())
-            {
-                capabilities["prompts"] = JSON::object();
+                args = params["arguments"];
             }
 
-            JSON result_body = {
-                {"supportedVersions", JSON::array({std::string(PROTOCOL_VERSION)})},
-                {"capabilities", std::move(capabilities)},
-                {"serverInfo", {
-                    {"name", server_info_.name},
-                    {"version", server_info_.version}
-                }}
-            };
-
-            return make_result(id, std::move(result_body));
-        }
-
-        JSON handle_tools_list(const JSON& id)
-        {
-            JSON tools_array = JSON::array();
-
-            for (const auto& [name, tool] : tools_)
+            LegacyToolHandler handler{nullptr};
             {
-                // Defensive: some older builds accidentally stored the schema
-                // as a one-element array. Unwrap it so we always emit a plain object.
-                JSON schema = tool.input_schema;
-                if (schema.is_array() && !schema.empty() && schema[0].is_object())
+                std::shared_lock<std::shared_mutex> lock{mutex_};
+                auto it = handlers_.find(tool_name);
+                if (it != handlers_.end())
                 {
-                    schema = schema[0];
-                }
-
-                tools_array.push_back({
-                    {"name", tool.name},
-                    {"description", tool.description},
-                    {"inputSchema", std::move(schema)}
-                });
-            }
-
-            return make_result(id, {{"tools", std::move(tools_array)}});
-        }
-
-        JSON handle_tools_call(const JSON& id, const JSON& params)
-        {
-            JSON result = nullptr;
-
-            if (!params.contains("name") || !params["name"].is_string())
-            {
-                result = make_error(id, error_code::INVALID_PARAMS, "Missing or invalid 'name'");
-            }
-            else
-            {
-                const std::string tool_name = params["name"].get<std::string>();
-                JSON arguments = params.value("arguments", JSON::object());
-
-                auto call_result = call_tool(tool_name, arguments);
-
-                if (call_result.has_value())
-                {
-                    // MCP tools/call result format
-                    result = make_result(id, {
-                        {"content", JSON::array({
-                            {
-                                {"type", "text"},
-                                {"text", call_result.value().dump()}
-                            }
-                        })},
-                        {"isError", false}
-                    });
-                }
-                else
-                {
-                    result = make_error(
-                        id,
-                        call_result.error().code,
-                        call_result.error().message,
-                        call_result.error().data
-                    );
+                    handler = it->second;
                 }
             }
 
-            return result;
-        }
-
-        Expected<JSON, Error> call_tool(const std::string& name, const JSON& arguments)
-        {
-            Expected<JSON, Error> result{};
-
-            auto it = tools_.find(name);
-            if (it == tools_.end())
-            {
-                result = Error{
-                    error_code::METHOD_NOT_FOUND,
-                    "Unknown tool: " + name
-                };
-            }
-            else if (!it->second.handler)
-            {
-                result = Error{
-                    error_code::INTERNAL_ERROR,
-                    "Tool has no handler: " + name
-                };
-            }
-            else
+            ToolCallResult call_res{};
+            if (handler)
             {
                 try
                 {
-                    result = it->second.handler(arguments);
+                    call_res = handler(args);
                 }
                 catch (const std::exception& e)
                 {
-                    result = Error{
-                        error_code::INTERNAL_ERROR,
-                        std::string("Tool threw exception: ") + e.what()
-                    };
+                    call_res.is_error = true;
+                    call_res.content = std::string("Exception in tool execution: ") + e.what();
                 }
                 catch (...)
                 {
-                    result = Error{
-                        error_code::INTERNAL_ERROR,
-                        "Tool threw unknown exception"
-                    };
+                    call_res.is_error = true;
+                    call_res.content = "Unknown exception in tool execution";
                 }
             }
+            else
+            {
+                call_res.is_error = true;
+                call_res.content = "Tool not found: " + tool_name;
+            }
 
-            return result;
+            return call_res.to_json();
         }
 
-        // ----------------------------------------------------------------
-        //  Convenience helpers
-        // ----------------------------------------------------------------
-        JSON build_openai_style_schema() const
+        [[nodiscard]] static std::string make_error_response(
+            ErrorCode code,
+            std::string message,
+            std::optional<Json> id = std::nullopt,
+            std::optional<Json> data = std::nullopt)
         {
-            JSON schema = JSON::array();
-
-            for (const auto& [name, tool] : tools_)
+            Json error{{"code", static_cast<int>(code)}, {"message", std::move(message)}};
+            if (data)
             {
-                JSON parameters = tool.input_schema;
-                if (parameters.is_array() && !parameters.empty() && parameters[0].is_object())
-                {
-                    parameters = parameters[0];
-                }
-
-                schema.push_back({
-                    {"type", "function"},
-                    {"function", {
-                        {"name", tool.name},
-                        {"description", tool.description},
-                        {"parameters", std::move(parameters)}
-                    }}
-                });
+                error["data"] = *data;
             }
-
-            return schema;
+            Json response{{"jsonrpc", "2.0"}, {"error", std::move(error)}};
+            if (id && is_valid_request_id(*id))
+            {
+                response["id"] = *id;
+            }
+            return response.dump();
         }
     };
 }

@@ -1,357 +1,244 @@
 // ============================================================================
-//  protocol.hpp — MCP Protocol Helpers (C++20)
-//  Project: mcpxx
-//  Developed by: Pooria Yousefi
-//  License: Apache 2.0
+//  pooriayousefi/mcp/protocol.hpp — JSON-RPC and MCP Protocol Types
+//  Project: mcpxx | C++20 | Apache-2.0
 //
-//  Build example (tests):
-//    clang++ -std=c++20 -O3 -I include tests/protocol_tests.cpp -o bin/protocol_tests
+//  Declares the message, tool, and result data types shared by the client,
+//  server, and transports. The advertised protocol version is defined here.
 // ============================================================================
+
 #pragma once
 
-#include "nlohmann/json.hpp"
-
-#include <cstdlib>
-#include <optional>
 #include <string>
 #include <string_view>
-#include <utility>
+#include <vector>
+#include <optional>
+#include "pooriayousefi/utility/common.hpp"
+#include "nlohmann/json.hpp"
 
 namespace pooriayousefi::mcp
 {
-    using JSON = nlohmann::json;
+    inline constexpr std::string_view MCP_PROTOCOL_VERSION{"2026-07-28"};
 
-    // ----------------------------------------------------------------
-    //  Protocol constants
-    // ----------------------------------------------------------------
-    inline constexpr std::string_view PROTOCOL_VERSION = "2026-07-28";
-    inline constexpr std::string_view JSONRPC_VERSION  = "2.0";
-
-    inline constexpr std::string_view META_PROTOCOL_VERSION   = "io.modelcontextprotocol/protocolVersion";
-    inline constexpr std::string_view META_CLIENT_INFO        = "io.modelcontextprotocol/clientInfo";
-    inline constexpr std::string_view META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
-    inline constexpr std::string_view META_SERVER_INFO        = "io.modelcontextprotocol/serverInfo";
-
-    // ----------------------------------------------------------------
-    //  Official JSON-RPC + MCP error codes
-    // ----------------------------------------------------------------
-    namespace error_code
+    enum class ErrorCode
     {
-        inline constexpr int PARSE_ERROR                   = -32700;
-        inline constexpr int INVALID_REQUEST               = -32600;
-        inline constexpr int METHOD_NOT_FOUND              = -32601;
-        inline constexpr int INVALID_PARAMS                = -32602;
-        inline constexpr int INTERNAL_ERROR                = -32603;
+        PARSE_ERROR      = -32700,
+        INVALID_REQUEST  = -32600,
+        METHOD_NOT_FOUND = -32601,
+        INVALID_PARAMS   = -32602,
+        INTERNAL_ERROR   = -32603,
+        HEADER_MISMATCH  = -32020,
+        UNSUPPORTED_PROTOCOL_VERSION = -32022
+    };
 
-        // MCP-specific (2026-07-28)
-        inline constexpr int UNSUPPORTED_PROTOCOL_VERSION  = -32022;
+    inline constexpr std::string_view MCP_PROTOCOL_VERSION_META{"io.modelcontextprotocol/protocolVersion"};
+    inline constexpr std::string_view MCP_CLIENT_INFO_META{"io.modelcontextprotocol/clientInfo"};
+    inline constexpr std::string_view MCP_CLIENT_CAPABILITIES_META{"io.modelcontextprotocol/clientCapabilities"};
+
+    [[nodiscard]] inline Json make_request_metadata()
+    {
+        return Json{
+            {std::string{MCP_PROTOCOL_VERSION_META}, std::string{MCP_PROTOCOL_VERSION}},
+            {std::string{MCP_CLIENT_INFO_META}, {{"name", "sauron"}, {"version", "1.0.0"}}},
+            {std::string{MCP_CLIENT_CAPABILITIES_META}, Json::object()}
+        };
     }
 
-    // ----------------------------------------------------------------
-    //  Error — rich, future-proof error type used throughout mcpxx
-    // ----------------------------------------------------------------
-    struct Error
+    [[nodiscard]] inline bool is_valid_request_id(const Json& id)
     {
-        int         code    = 0;
+        return id.is_string() || id.is_number_integer();
+    }
+
+    struct JsonRpcError
+    {
+        int code{0};
         std::string message{};
-        JSON        data    = nullptr;   // optional extra payload from the server
+        std::optional<Json> data{};
 
-        Error() = default;
-
-        Error(int c, std::string msg)
-            : code{c}
-            , message{std::move(msg)}
+        [[nodiscard]] Json to_json() const
         {
-        }
-
-        Error(int c, std::string msg, JSON d)
-            : code{c}
-            , message{std::move(msg)}
-            , data{std::move(d)}
-        {
-        }
-
-        // Convenience factories
-        static Error from_json_rpc(const JSON& error_obj)
-        {
-            Error result{};
-
-            if (error_obj.is_object())
+            Json j{};
+            j["code"] = code;
+            j["message"] = message;
+            if (data.has_value())
             {
-                if (error_obj.contains("code") && error_obj["code"].is_number_integer())
-                {
-                    result.code = error_obj["code"].get<int>();
-                }
-                if (error_obj.contains("message") && error_obj["message"].is_string())
-                {
-                    result.message = error_obj["message"].get<std::string>();
-                }
-                if (error_obj.contains("data"))
-                {
-                    result.data = error_obj["data"];
-                }
+                j["data"] = data.value();
             }
-            else
+            return j;
+        }
+
+        static JsonRpcError from_json(const Json& j)
+        {
+            JsonRpcError err{};
+            if (j.contains("code") && j["code"].is_number())
             {
-                result.code    = error_code::INTERNAL_ERROR;
-                result.message = "Malformed error object received from peer";
+                err.code = j["code"].get<int>();
             }
-
-            return result;
-        }
-
-        static Error make(int c, std::string msg)
-        {
-            return Error{c, std::move(msg)};
-        }
-
-        static Error make(int c, std::string msg, JSON d)
-        {
-            return Error{c, std::move(msg), std::move(d)};
+            if (j.contains("message") && j["message"].is_string())
+            {
+                err.message = j["message"].get<std::string>();
+            }
+            if (j.contains("data"))
+            {
+                err.data = j["data"];
+            }
+            return err;
         }
     };
 
-    // ----------------------------------------------------------------
-    //  Client / Server identity
-    // ----------------------------------------------------------------
-    struct ClientInfo
+    struct JsonRpcMessage
+    {
+        std::string jsonrpc{"2.0"};
+        std::string method{};
+        Json params = Json(Json::value_t::discarded);
+        Json id = Json(Json::value_t::discarded);
+        Json result = Json(Json::value_t::discarded);
+        std::optional<JsonRpcError> error{std::nullopt};
+
+        [[nodiscard]] bool is_request() const
+        {
+            return jsonrpc == "2.0" && !method.empty() &&
+                   !id.is_discarded() && is_valid_request_id(id);
+        }
+
+        [[nodiscard]] bool is_notification() const
+        {
+            return jsonrpc == "2.0" && !method.empty() && id.is_discarded();
+        }
+
+        [[nodiscard]] bool is_response() const
+        {
+            const bool has_result = !result.is_discarded();
+            return jsonrpc == "2.0" && method.empty() &&
+                   is_valid_request_id(id) && (has_result != error.has_value());
+        }
+
+        [[nodiscard]] Json to_json() const
+        {
+            Json j{};
+            j["jsonrpc"] = jsonrpc;
+            if (!method.empty())
+            {
+                j["method"] = method;
+            }
+            if (!params.is_discarded())
+            {
+                j["params"] = params;
+            }
+            if (!id.is_discarded())
+            {
+                j["id"] = id;
+            }
+            if (!result.is_discarded())
+            {
+                j["result"] = result;
+            }
+            if (error.has_value())
+            {
+                j["error"] = error.value().to_json();
+            }
+            return j;
+        }
+
+        static JsonRpcMessage from_json(const Json& j)
+        {
+            JsonRpcMessage msg{};
+            if (j.contains("jsonrpc") && j["jsonrpc"].is_string())
+            {
+                msg.jsonrpc = j["jsonrpc"].get<std::string>();
+            }
+            if (j.contains("method") && j["method"].is_string())
+            {
+                msg.method = j["method"].get<std::string>();
+            }
+            if (j.contains("params"))
+            {
+                msg.params = j["params"];
+            }
+            if (j.contains("id"))
+            {
+                msg.id = j["id"];
+            }
+            if (j.contains("result"))
+            {
+                msg.result = j["result"];
+            }
+            if (j.contains("error") && j["error"].is_object())
+            {
+                msg.error = JsonRpcError::from_json(j["error"]);
+            }
+            return msg;
+        }
+    };
+
+    struct ToolDefinition
     {
         std::string name{};
-        std::string version{};
+        std::string description{};
+        Json input_schema{Json::object()};
+
+        [[nodiscard]] Json to_json() const
+        {
+            Json j{};
+            j["name"] = name;
+            j["description"] = description;
+            j["inputSchema"] = input_schema;
+            return j;
+        }
+
+        static ToolDefinition from_json(const Json& j)
+        {
+            ToolDefinition tool{};
+            if (j.contains("name") && j["name"].is_string())
+            {
+                tool.name = j["name"].get<std::string>();
+            }
+            if (j.contains("description") && j["description"].is_string())
+            {
+                tool.description = j["description"].get<std::string>();
+            }
+            if (j.contains("inputSchema") && j["inputSchema"].is_object())
+            {
+                tool.input_schema = j["inputSchema"];
+            }
+            return tool;
+        }
     };
 
-    struct ServerInfo
+    struct ToolCallResult
     {
-        std::string name{};
-        std::string version{};
+        std::string content{};
+        bool is_error{false};
+
+        [[nodiscard]] Json to_json() const
+        {
+            Json j{};
+            j["resultType"] = "complete";
+            Json content_arr = Json::array();
+            Json content_item = Json::object();
+            content_item["type"] = "text";
+            content_item["text"] = content;
+            content_arr.push_back(content_item);
+            j["content"] = content_arr;
+            j["isError"] = is_error;
+            return j;
+        }
+
+        static ToolCallResult from_json(const Json& j)
+        {
+            ToolCallResult res{};
+            if (j.contains("isError") && j["isError"].is_boolean())
+            {
+                res.is_error = j["isError"].get<bool>();
+            }
+            if (j.contains("content") && j["content"].is_array() && !j["content"].empty())
+            {
+                const auto& item = j["content"][0];
+                if (item.contains("text") && item["text"].is_string())
+                {
+                    res.content = item["text"].get<std::string>();
+                }
+            }
+            return res;
+        }
     };
-
-    // ----------------------------------------------------------------
-    //  Request metadata helpers
-    // ----------------------------------------------------------------
-    inline JSON make_request_meta(
-        const ClientInfo& client,
-        JSON capabilities = JSON::object()
-    )
-    {
-        return {
-            {std::string(META_PROTOCOL_VERSION), PROTOCOL_VERSION},
-            {std::string(META_CLIENT_INFO), {
-                {"name", client.name},
-                {"version", client.version}
-            }},
-            {std::string(META_CLIENT_CAPABILITIES), std::move(capabilities)}
-        };
-    }
-
-    // Creates a JSON-RPC request with MCP metadata.
-    inline JSON make_request(
-        const JSON& id,
-        std::string method,
-        JSON params,
-        const ClientInfo& client,
-        JSON capabilities = JSON::object()
-    )
-    {
-        if (!params.is_object())
-        {
-            params = JSON::object();
-        }
-        params["_meta"] = make_request_meta(client, std::move(capabilities));
-
-        return {
-            {"jsonrpc", JSONRPC_VERSION},
-            {"id", id},
-            {"method", std::move(method)},
-            {"params", std::move(params)}
-        };
-    }
-
-    // Notifications have no ID and do not receive a response.
-    inline JSON make_notification(
-        std::string method,
-        JSON params = JSON::object()
-    )
-    {
-        if (!params.is_object())
-        {
-            params = JSON::object();
-        }
-
-        return {
-            {"jsonrpc", JSONRPC_VERSION},
-            {"method", std::move(method)},
-            {"params", std::move(params)}
-        };
-    }
-
-    inline JSON make_result(
-        const JSON& id,
-        JSON result
-    )
-    {
-        return {
-            {"jsonrpc", JSONRPC_VERSION},
-            {"id", id},
-            {"result", std::move(result)}
-        };
-    }
-
-    inline JSON make_error(
-        const JSON& id,
-        int code,
-        std::string message,
-        JSON data = nullptr
-    )
-    {
-        JSON error = {
-            {"code", code},
-            {"message", std::move(message)}
-        };
-
-        if (!data.is_null())
-        {
-            error["data"] = std::move(data);
-        }
-
-        return {
-            {"jsonrpc", JSONRPC_VERSION},
-            {"id", id},
-            {"error", std::move(error)}
-        };
-    }
-
-    // ----------------------------------------------------------------
-    //  server/discover helpers (mandatory in 2026-07-28)
-    // ----------------------------------------------------------------
-    inline JSON make_discover_request(
-        const JSON& id,
-        const ClientInfo& client,
-        JSON capabilities = JSON::object()
-    )
-    {
-        return make_request(id, "server/discover", JSON::object(), client, std::move(capabilities));
-    }
-
-    // Typical successful discover result shape (for documentation / tests)
-    inline JSON make_discover_result(
-        const JSON& id,
-        const ServerInfo& server,
-        JSON supported_versions = JSON::array({std::string(PROTOCOL_VERSION)}),
-        JSON capabilities = JSON::object()
-    )
-    {
-        JSON result = {
-            {"supportedVersions", std::move(supported_versions)},
-            {"capabilities", std::move(capabilities)},
-            {"serverInfo", {
-                {"name", server.name},
-                {"version", server.version}
-            }}
-        };
-
-        return make_result(id, std::move(result));
-    }
-
-    // ----------------------------------------------------------------
-    //  Validation helpers
-    // ----------------------------------------------------------------
-    inline bool is_valid_id(const JSON& id)
-    {
-        return id.is_string() || id.is_number_integer() || id.is_number_unsigned();
-    }
-
-    inline bool is_valid_request(const JSON& message)
-    {
-        bool result = false;
-
-        if (!message.is_object())
-        {
-            result = false;
-        }
-        else if (
-            !message.contains("jsonrpc") ||
-            !message["jsonrpc"].is_string() ||
-            message["jsonrpc"] != JSONRPC_VERSION
-        )
-        {
-            result = false;
-        }
-        else if (
-            !message.contains("method") ||
-            !message["method"].is_string()
-        )
-        {
-            result = false;
-        }
-        else if (
-            message.contains("id") &&
-            !is_valid_id(message["id"])
-        )
-        {
-            result = false;
-        }
-        else if (
-            message.contains("params") &&
-            !message["params"].is_object() &&
-            !message["params"].is_array()
-        )
-        {
-            result = false;
-        }
-        else
-        {
-            // A request must have an ID. Without one, it is a notification.
-            result = message.contains("id");
-        }
-
-        return result;
-    }
-
-    inline bool is_notification(const JSON& message)
-    {
-        return message.is_object()
-            && message.value("jsonrpc", std::string{}) == JSONRPC_VERSION
-            && message.contains("method")
-            && message["method"].is_string()
-            && !message.contains("id");
-    }
-
-    inline bool has_valid_mcp_meta(const JSON& message)
-    {
-        bool result = false;
-
-        if (
-            !message.is_object()
-            || !message.contains("params")
-            || !message["params"].is_object()
-        )
-        {
-            result = false;
-        }
-        else
-        {
-            const auto& params = message["params"];
-
-            if (
-                !params.contains("_meta")
-                || !params["_meta"].is_object()
-            )
-            {
-                result = false;
-            }
-            else
-            {
-                const auto& meta = params["_meta"];
-
-                result = meta.contains(std::string(META_PROTOCOL_VERSION))
-                    && meta[std::string(META_PROTOCOL_VERSION)].is_string()
-                    && meta[std::string(META_PROTOCOL_VERSION)] == PROTOCOL_VERSION
-                    && meta.contains(std::string(META_CLIENT_CAPABILITIES))
-                    && meta[std::string(META_CLIENT_CAPABILITIES)].is_object();
-            }
-        }
-
-        return result;
-    }
-}
+} // namespace pooriayousefi::mcp
