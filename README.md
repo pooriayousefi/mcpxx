@@ -88,7 +88,7 @@ when the server is started in HTTP mode.
 | `utility` | 8098 | 14 string, JSON, and UUID tools |
 
 The file, directory, git, and shell servers operate on the host environment.
-The memory server persists its in-process key/value store to a JSON file.
+The memory server persists its in-process key/value store to `sauron_memory.json`. If that file is absent, it loads the legacy `mcpxx_memory.json` file when available; subsequent writes use `sauron_memory.json`.
 Statistics, random-number, time, and utility operations do not require access
 to a remote service.
 
@@ -125,7 +125,7 @@ server's environment. The `run_command` tool executes shell commands; do not
 enable it for untrusted clients or expose it on an untrusted network.
 
 ```sh
-MCPXX_SHELL_ENABLED=1 ./bin/shell_mcp_tool_server
+SAURON_SHELL_ENABLED=1 ./bin/shell_mcp_tool_server
 ```
 
 ## Create a tool server
