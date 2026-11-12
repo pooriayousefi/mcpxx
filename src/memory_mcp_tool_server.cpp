@@ -2,9 +2,31 @@
 //  src/memory_mcp_tool_server.cpp — MCP Persistent Key/Value Memory Server
 //  Project: mcpxx | C++20 | Apache-2.0
 //
-//  Provides memory save, recall, and key-listing tools. The in-process JSON
-//  store is synchronized and persisted to a file in the working directory.
-//  Runs over stdio by default or Streamable HTTP on port 8097 by default.
+//  Protocol: MCP 2026-07-28 ONLY (stateless; every request carries _meta).
+//  Transports: stdio (default) or Streamable HTTP.
+//
+//  Tools (read):
+//    recall_memory, list_keys
+//
+//  Tools (write):
+//    save_memory
+//
+//  Safety:
+//    - Copy-on-write Json state shared via smart pointers (no raw pointers)
+//    - Mutex-guarded snapshot reads and writes
+//    - Observer watchers persist the full state to disk after every mutation
+//    - Default store file: sauron_memory.json (working directory)
+//    - Reads the previous mcpxx_memory.json file when the new store is absent
+//    - Values are arbitrary Json (string, number, object, array, etc.)
+//
+//  Build:
+//    clang++ -std=c++20 -O3 -pthread -I include src/memory_mcp_tool_server.cpp -o bin/memory_mcp_tool_server
+//    clang++ -std=c++20 -O3 -pthread -I include src/memory_mcp_tool_server.cpp -o bin/memory_mcp_tool_server -lws2_32 (Windows)
+//    g++     -std=c++20 -O3 -pthread -I include src/memory_mcp_tool_server.cpp -o bin/memory_mcp_tool_server
+//
+//  Usage:
+//    ./bin/memory_mcp_tool_server                      (stdio; run from project root)
+//    ./bin/memory_mcp_tool_server http 127.0.0.1 8097  (Streamable HTTP)
 // ============================================================================
 
 #include "pooriayousefi/utility/common.hpp"
@@ -22,7 +44,8 @@
 
 namespace pooriayousefi::mcp
 {
-    constexpr const char* DEFAULT_MEMORY_FILE = "mcpxx_memory.json";
+    constexpr const char* DEFAULT_MEMORY_FILE = "sauron_memory.json";
+    constexpr const char* LEGACY_MEMORY_FILE = "mcpxx_memory.json";
 
     Expected<std::string, Error> require_string_arg(const Json& args, const char* key)
     {
@@ -123,6 +146,11 @@ namespace pooriayousefi::mcp
         void load()
         {
             std::ifstream file(file_path_);
+            if (!file)
+            {
+                file.clear();
+                file.open(LEGACY_MEMORY_FILE);
+            }
             if (file)
             {
                 Json loaded = Json::parse(file, nullptr, false);
@@ -234,7 +262,7 @@ int main(int argc, char* argv[])
     );
 
     Server server{"mcp-tool-memory-server", "1.0.0"};
-    server.set_instructions("Memory tools: read (recall_memory, list_keys) and write (save_memory). Values are arbitrary Json; every mutation persists the full state to mcpxx_memory.json in the working directory, which is restored on startup. recall_memory returns null for unknown keys; list_keys reports every stored key with the total count.");
+    server.set_instructions(    "Memory tools: read (recall_memory, list_keys) and write (save_memory). Values are arbitrary Json; every mutation persists the full state to sauron_memory.json in the working directory, which is restored on startup. recall_memory returns null for unknown keys; list_keys reports every stored key with the total count.");
 
     const Json key_prop = {
         {"type", "string"},

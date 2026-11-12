@@ -1,10 +1,43 @@
 // ============================================================================
-//  src/shell_mcp_tool_server.cpp — MCP Shell and Program Execution Server
-//  Project: mcpxx | C++20 | Apache-2.0
+//  shell_mcp_tool_server.cpp — MCP Tool Server for controlled shell / program execution
+//  Project: SAURON (Specialized Autonomous Units for Reasoning, Orchestration, and Navigation)
+//  Developed by: Pooria Yousefi
+//  License: Apache 2.0
 //
-//  Provides shell-command and direct-program execution tools. Execution is
-//  disabled unless MCPXX_SHELL_ENABLED=1 is set. Runs over stdio by default
-//  or Streamable HTTP on port 8090 by default; treat access as privileged.
+//  Protocol: MCP 2026-07-28 ONLY (stateless; every request carries _meta).
+//
+//  v2 migration (server.hpp 2026-07-28):
+//    - add_tool() now takes a Tool struct (name/description/input_schema/handler).
+//    - run_command/run_program results built with Json::object(...) (the
+//      single-pair braced-init form can degrade into a Json array).
+//    - stdio/HTTP selection delegated to Server::run_cli (stdio default,
+//      "http [host] [port]" or "--http [host] [port]" for Streamable HTTP).
+//    - Added <cstdio>, <algorithm>, <cctype> (were relied on transitively).
+//
+//  Tools:
+//    run_command  — executes arbitrary shell commands via popen (supports pipes, redirects, &&)
+//    run_program  — executes a program directly via process.hpp (no shell, injection-safe)
+//
+//  Safety:
+//    - Denylist of catastrophic patterns
+//    - Must set environment variable SAURON_SHELL_ENABLED=1 to enable execution
+//
+//  Build:
+//
+//    macOS / Linux:
+//      clang++ -std=c++20 -O3 -pthread -I include src/shell_mcp_tool_server.cpp -o bin/shell_mcp_tool_server
+//
+//    Linux (gcc):
+//      g++ -std=c++20 -O3 -pthread -I include src/shell_mcp_tool_server.cpp -o bin/shell_mcp_tool_server
+//
+//    Windows (MinGW / clang):
+//      clang++ -std=c++20 -O3 -pthread -I include src/shell_mcp_tool_server.cpp -o bin/shell_mcp_tool_server.exe -lws2_32
+//
+//
+//  Usage:
+//      ./bin/shell_mcp_tool_server                  # stdio mode (default)
+//      ./bin/shell_mcp_tool_server http 127.0.0.1 8090
+//      ./bin/shell_mcp_tool_server --help
 // ============================================================================
 
 #include "pooriayousefi/utility/common.hpp"
@@ -32,7 +65,8 @@
 namespace pooriayousefi::mcp
 {
     constexpr std::size_t MAX_OUTPUT_LENGTH = 8000;
-    constexpr const char* ENV_SHELL_ENABLED = "MCPXX_SHELL_ENABLED";
+    constexpr const char* ENV_SHELL_ENABLED = "SAURON_SHELL_ENABLED";
+    constexpr const char* LEGACY_ENV_SHELL_ENABLED = "MCPXX_SHELL_ENABLED";
 
     // ------------------------------------------------------------------
     //  Helpers
@@ -41,8 +75,10 @@ namespace pooriayousefi::mcp
     {
         bool result = false;
         const char* flag = std::getenv(ENV_SHELL_ENABLED);
+        const char* legacy_flag = std::getenv(LEGACY_ENV_SHELL_ENABLED);
 
-        if (flag != nullptr && std::string(flag) == "1")
+        if ((flag != nullptr && std::string(flag) == "1") ||
+            (legacy_flag != nullptr && std::string(legacy_flag) == "1"))
         {
             result = true;
         }
@@ -141,7 +177,7 @@ namespace pooriayousefi::mcp
         {
             result.set_error(Error{
                 error_code::INTERNAL_ERROR,
-                "Shell execution is disabled. Set MCPXX_SHELL_ENABLED=1 to enable it "
+                "Shell execution is disabled. Set SAURON_SHELL_ENABLED=1 (or MCPXX_SHELL_ENABLED=1) to enable it "
                 "(only in a sandboxed environment)."
             });
         }
@@ -227,7 +263,7 @@ namespace pooriayousefi::mcp
         {
             result.set_error(Error{
                 error_code::INTERNAL_ERROR,
-                "Shell execution is disabled. Set MCPXX_SHELL_ENABLED=1 to enable it "
+                "Shell execution is disabled. Set SAURON_SHELL_ENABLED=1 (or MCPXX_SHELL_ENABLED=1) to enable it "
                 "(only in a sandboxed environment)."
             });
         }
@@ -312,7 +348,7 @@ int main(int argc, char* argv[])
         "command (pipes, redirects, &&) and returns combined stdout+stderr; "
         "run_program executes a binary directly without a shell (injection-safe). "
         "Both tools are disabled unless the environment variable "
-        "MCPXX_SHELL_ENABLED=1 is set (use only in a sandboxed environment)."
+        "SAURON_SHELL_ENABLED=1 or MCPXX_SHELL_ENABLED=1 is set (use only in a sandboxed environment)."
     );
 
     // ----- run_command -------------------------------------------------
@@ -321,7 +357,7 @@ int main(int argc, char* argv[])
     run_command_tool.description =
         "Executes an arbitrary shell command locally and returns combined stdout+stderr. "
         "Supports pipes, redirects, &&, etc. High-risk tool — protected by denylist and "
-        "MCPXX_SHELL_ENABLED environment variable.";
+        "SAURON_SHELL_ENABLED environment variable.";
     run_command_tool.input_schema = Json::parse(R"({
         "type": "object",
         "properties": {
@@ -378,7 +414,7 @@ int main(int argc, char* argv[])
     if (!shell_execution_enabled())
     {
         std::cerr << "WARNING: Shell execution is DISABLED. "
-                  << "Set MCPXX_SHELL_ENABLED=1 to enable it.\n";
+                  << "Set SAURON_SHELL_ENABLED=1 (or MCPXX_SHELL_ENABLED=1) to enable it.\n";
     }
 
     const int exit_code = server.run_cli(argc, argv, 8090);
